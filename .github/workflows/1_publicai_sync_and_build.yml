@@ -1,0 +1,238 @@
+name: 1 Public AI Sync Upstream and Build
+
+on:
+  schedule:
+    # Run daily at midnight UTC
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream tag to build from (leave empty to use latest stable upstream tag, e.g. v1.55.0)"
+        required: false
+        default: ""
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: lago-api
+
+jobs:
+  # Step 1: Discover upstream stable tag, create fresh release branch pai_release/pai-vX.X.X,
+  # and merge customized branch (pai-micro-payments).
+  sync-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      changes: ${{ steps.check-sync.outputs.changes }}
+      upstream_tag: ${{ steps.get-upstream-tag.outputs.upstream_tag }}
+      release_tag: ${{ steps.get-upstream-tag.outputs.release_tag }}
+      release_branch: ${{ steps.get-upstream-tag.outputs.release_branch }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/getlago/lago-api.git || true
+
+      # Extract latest stable semver tag (vX.X.X) ignoring rc and dev releases
+      - name: Determine upstream tag and release identifiers
+        id: get-upstream-tag
+        run: |
+          if [ -n "${{ github.event.inputs.upstream_tag }}" ]; then
+            UPSTREAM_TAG="${{ github.event.inputs.upstream_tag }}"
+          else
+            LINE=$(git ls-remote --tags upstream | grep -E 'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' | sort -t '/' -k 3 -V | tail -n 1)
+            UPSTREAM_TAG=$(echo "$LINE" | awk -F'/' '{print $3}')
+          fi
+
+          if [ -z "$UPSTREAM_TAG" ]; then
+            echo "Failed to determine upstream tag"
+            exit 1
+          fi
+
+          BASE_RELEASE_TAG="pai-${UPSTREAM_TAG}"
+          RELEASE_TAG="${BASE_RELEASE_TAG}-b${{ github.run_number }}"
+          RELEASE_BRANCH="pai_release/${BASE_RELEASE_TAG}"
+
+          echo "Upstream tag: $UPSTREAM_TAG"
+          echo "Release tag: $RELEASE_TAG"
+          echo "Release branch: $RELEASE_BRANCH"
+
+          echo "upstream_tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
+          echo "base_release_tag=$BASE_RELEASE_TAG" >> $GITHUB_OUTPUT
+          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+          echo "release_branch=$RELEASE_BRANCH" >> $GITHUB_OUTPUT
+
+      # Skip sync if a release tag for this upstream version already exists in origin (unless manually triggered via workflow_dispatch)
+      - name: Check if release tag already exists
+        id: check-sync
+        run: |
+          BASE_RELEASE_TAG="${{ steps.get-upstream-tag.outputs.base_release_tag }}"
+          git fetch origin --tags
+
+          if git tag -l "${BASE_RELEASE_TAG}" "${BASE_RELEASE_TAG}-b*" | grep -q .; then
+            echo "Release tag for $BASE_RELEASE_TAG already exists in our repository. No sync needed."
+            echo "changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "Release tag for $BASE_RELEASE_TAG is new! Sync needed."
+            echo "changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Fetch branches and tags
+        if: steps.check-sync.outputs.changes == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          UPSTREAM_TAG="${{ steps.get-upstream-tag.outputs.upstream_tag }}"
+          git fetch upstream tag "$UPSTREAM_TAG" --no-tags
+          git fetch origin pai-micro-payments
+
+      # Re-create a clean release branch from upstream tag, merge our custom branch,
+      # and align .github/workflows with origin/main so standard GITHUB_TOKEN can push without workflow-scope errors.
+      - name: Create release branch and merge customizations
+        if: steps.check-sync.outputs.changes == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          UPSTREAM_TAG="${{ steps.get-upstream-tag.outputs.upstream_tag }}"
+          RELEASE_TAG="${{ steps.get-upstream-tag.outputs.release_tag }}"
+          RELEASE_BRANCH="${{ steps.get-upstream-tag.outputs.release_branch }}"
+
+          git checkout -B "$RELEASE_BRANCH" "$UPSTREAM_TAG"
+          git merge --no-edit origin/pai-micro-payments
+
+          # Keep workflow files aligned with main to avoid GitHub pre-receive hook rejecting pushes that alter workflows without 'workflow' token scope
+          git checkout origin/main -- .github/workflows
+          if ! git diff --quiet --cached -- .github/workflows || ! git diff --quiet -- .github/workflows; then
+            git add .github/workflows
+            git commit -m "chore: align workflows with main for release build"
+          fi
+
+          git tag -f "$RELEASE_TAG"
+
+      # Push branch and tag to remote origin so Docker builds checkout this exact release state
+      - name: Push release branch and tag
+        if: steps.check-sync.outputs.changes == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          RELEASE_TAG="${{ steps.get-upstream-tag.outputs.release_tag }}"
+          RELEASE_BRANCH="${{ steps.get-upstream-tag.outputs.release_branch }}"
+
+          git push origin "$RELEASE_BRANCH" --force
+          git push origin "$RELEASE_TAG" --force
+
+  # Step 2: Build Lago API Docker image and push to GHCR tagged with pai-vX.X.X and latest.
+  build-and-push-api:
+    needs: sync-and-release
+    if: needs.sync-and-release.outputs.changes == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout merged release code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync-and-release.outputs.release_branch }}
+
+      - name: Add version into docker image
+        run: |
+          echo "${{ needs.sync-and-release.outputs.release_tag }}" > LAGO_VERSION
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+
+      - name: Build and push Lago API Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          pull: true
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ needs.sync-and-release.outputs.release_tag }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            SEGMENT_WRITE_KEY=${{ secrets.SEGMENT_WRITE_KEY }}
+
+  # Step 3: Run boot contract test on the pushed GHCR image
+  boot-contract-test:
+    name: Boot Contract Test
+    needs: [sync-and-release, build-and-push-api]
+    if: needs.sync-and-release.outputs.changes == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: getlago/postgres-partman:15.0-alpine
+        ports:
+          - "5432:5432"
+        env:
+          POSTGRES_DB: lago
+          POSTGRES_USER: lago
+          POSTGRES_PASSWORD: lago
+        options: >-
+          --health-cmd "pg_isready -U lago -d lago"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - "6379:6379"
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull and tag Image from GHCR
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ needs.sync-and-release.outputs.release_tag }}"
+          docker pull "$IMAGE"
+          docker tag "$IMAGE" lago-api:test
+
+      - name: Generate RSA Key
+        run: echo "LAGO_RSA_PRIVATE_KEY=$(openssl genrsa 2048 | openssl base64 -A)" >> "$GITHUB_ENV"
+
+      - name: Assert Boot Contract
+        run: ci/docker-boot-contract.sh lago-api:test
+        env:
+          DATABASE_URL: postgresql://lago:lago@127.0.0.1:5432/lago
+          REDIS_URL: redis://127.0.0.1:6379
+
+      - name: Container Logs on Failure
+        if: failure()
+        run: tail -n 200 /tmp/*.log || true
