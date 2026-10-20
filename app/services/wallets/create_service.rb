@@ -22,14 +22,14 @@ module Wallets
       return result.forbidden_failure! if connections_requested? && organization_flag_disabled?(:multi_connection)
       return result unless valid?
 
-      code = params[:code]
-
-      # only adjust generated code if it's taken
-      if code.blank?
-        code = params[:name].to_s.parameterize(separator: "_").presence || "default"
-        code_taken = Wallet.where(organization_id:, customer_id: customer.id, status: "active", code: code).exists?
-        code += "_#{Time.current.to_i}" if code_taken
+      # Strict single active wallet per customer: idempotently return existing wallet
+      existing_wallet = customer.wallets.active.order(created_at: :asc).first
+      if existing_wallet.present?
+        result.wallet = existing_wallet
+        return result
       end
+
+      code = params[:code].presence || params[:name].to_s.parameterize(separator: "_").presence || "default" 
 
       attributes = {
         organization_id:,
