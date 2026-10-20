@@ -57,29 +57,31 @@ jobs:
             exit 1
           fi
 
-          RELEASE_TAG="pai-${UPSTREAM_TAG}"
-          RELEASE_BRANCH="pai_release/${RELEASE_TAG}"
+          BASE_RELEASE_TAG="pai-${UPSTREAM_TAG}"
+          RELEASE_TAG="${BASE_RELEASE_TAG}-b${{ github.run_number }}"
+          RELEASE_BRANCH="pai_release/${BASE_RELEASE_TAG}"
 
           echo "Upstream tag: $UPSTREAM_TAG"
           echo "Release tag: $RELEASE_TAG"
           echo "Release branch: $RELEASE_BRANCH"
 
           echo "upstream_tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
+          echo "base_release_tag=$BASE_RELEASE_TAG" >> $GITHUB_OUTPUT
           echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
           echo "release_branch=$RELEASE_BRANCH" >> $GITHUB_OUTPUT
 
-      # Skip sync if release tag already exists in origin (unless manually triggered via workflow_dispatch)
+      # Skip sync if a release tag for this upstream version already exists in origin (unless manually triggered via workflow_dispatch)
       - name: Check if release tag already exists
         id: check-sync
         run: |
-          RELEASE_TAG="${{ steps.get-upstream-tag.outputs.release_tag }}"
+          BASE_RELEASE_TAG="${{ steps.get-upstream-tag.outputs.base_release_tag }}"
           git fetch origin --tags
 
-          if git rev-parse "$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "Release tag $RELEASE_TAG already exists in our repository. No sync needed."
+          if git tag -l "${BASE_RELEASE_TAG}" "${BASE_RELEASE_TAG}-b*" | grep -q .; then
+            echo "Release tag for $BASE_RELEASE_TAG already exists in our repository. No sync needed."
             echo "changes=false" >> $GITHUB_OUTPUT
           else
-            echo "Release tag $RELEASE_TAG is new! Sync needed."
+            echo "Release tag for $BASE_RELEASE_TAG is new! Sync needed."
             echo "changes=true" >> $GITHUB_OUTPUT
           fi
 
